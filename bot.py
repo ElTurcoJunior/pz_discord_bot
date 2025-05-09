@@ -1,12 +1,10 @@
 import os
 import discord
 from discord.ext import tasks
-import psutil
-import re
 from datetime import datetime
 from dotenv import load_dotenv
 import sqlite3
-import asyncio
+import re
 
 # Cargar variables de entorno
 load_dotenv()
@@ -16,40 +14,41 @@ SERVER_NAME = os.getenv('SERVER_NAME')
 SERVER_PATH = os.getenv('SERVER_PATH')
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL'))
 
-# Configurar intents de Discord
 intents = discord.Intents.default()
-intents.message_content = True
 client = discord.Client(intents=intents)
 
-async def get_player_count():
+def get_top_killers(db_path, top_n=15):
+    players = []
     try:
-        # Conectar a la base de datos
-        db_path = os.path.join(SERVER_PATH, 'db', 'players.db')
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-
-        # Contar jugadores activos
-        cursor.execute("SELECT COUNT(*) FROM networkPlayers WHERE isDead = 0")
-        count = cursor.fetchone()[0]
-
-        # Obtener nombres de jugadores
-        cursor.execute("SELECT name FROM networkPlayers WHERE isDead = 0")
-        players = [row[0] for row in cursor.fetchall()]
-
+        cursor.execute("SELECT name, data FROM networkPlayers")
+        for name, data in cursor.fetchall():
+            if data is None:
+                continue
+            # Buscar el patrón ZombieKills en el binario
+            match = re.search(rb'ZombieKills\x00*([0-9]+)', data)
+            if not match:
+                # Alternativamente, busca el patrón como string seguido de 4 bytes (int)
+                match = re.search(rb'ZombieKills\x00{0,3}(.{4})', data)
+                if match:
+                    # Interpreta los 4 bytes como un entero little-endian
+                    kills = int.from_bytes(match.group(1), 'little')
+                else:
+                    kills = 0
+            else:
+                try:
+                    kills = int(match.group(1))
+                except Exception:
+                    kills = 0
+            players.append((name, kills))
         conn.close()
-        return count, players
     except Exception as e:
-        print(f"Error al obtener jugadores: {e}")
-        return 0, []
-
-def is_server_running():
-    for proc in psutil.process_iter(['name', 'cmdline']):
-        try:
-            if 'java' in proc.info['name'].lower() and any('ProjectZomboid' in cmd for cmd in proc.info['cmdline']):
-                return True
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    return False
+        print(f"Error al leer la base de datos: {e}")
+        return []
+    # Ordenar de mayor a menor
+    players.sort(key=lambda x: x[1], reverse=True)
+    return players[:top_n]
 
 @client.event
 async def on_ready():
@@ -60,22 +59,26 @@ async def on_ready():
 async def update_status():
     channel = client.get_channel(CHANNEL_ID)
     if not channel:
+        print("No se pudo encontrar el canal de Discord.")
         return
 
-    server_status = "🟢 Online" if is_server_running() else "🔴 Offline"
-    player_count, players = await get_player_count()
+    db_path = SERVER_PATH  # Ahora SERVER_PATH debe ser la ruta completa a players.db
+    if not os.path.exists(db_path):
+        ranking = "No se encontró la base de datos."
+    else:
+        top_players = get_top_killers(db_path)
+        if not top_players:
+            ranking = "No hay datos de jugadores."
+        else:
+            ranking = ""
+            for idx, (name, kills) in enumerate(top_players, 1):
+                ranking += f"**{idx}. {name}** — {kills} kills\n"
 
     embed = discord.Embed(
-        title=f"Estado del Servidor: {SERVER_NAME}",
-        color=discord.Color.green() if server_status == "🟢 Online" else discord.Color.red()
+        title=f"Ranking de Kills - {SERVER_NAME}",
+        color=discord.Color.gold()
     )
-
-    embed.add_field(name="Estado", value=server_status, inline=False)
-    embed.add_field(name="Jugadores Online", value=f"{player_count}/16", inline=False)
-
-    if players:
-        embed.add_field(name="Jugadores Conectados", value="\n".join(players), inline=False)
-
+    embed.add_field(name="Top 15 jugadores con más kills", value=ranking, inline=False)
     embed.set_footer(text=f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Buscar y editar el último mensaje del bot
@@ -84,7 +87,6 @@ async def update_status():
             await message.edit(embed=embed)
             return
 
-    # Si no se encuentra mensaje anterior, enviar uno nuevo
     await channel.send(embed=embed)
 
 client.run(DISCORD_TOKEN)
