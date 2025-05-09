@@ -1,53 +1,82 @@
 import os
 import discord
 from discord.ext import tasks
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import sqlite3
-import re
 
 # Cargar variables de entorno
 load_dotenv()
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
 SERVER_NAME = os.getenv('SERVER_NAME')
-SERVER_PATH = os.getenv('SERVER_PATH')
+BIN_FOLDER = os.getenv('BIN_FOLDER')  # Ruta a la carpeta con los .bin
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL'))
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-def get_top_killers(db_path, top_n=15):
+def get_stat_from_bin(data, stat_name):
+    idx = data.find(stat_name.encode())
+    if idx != -1:
+        idx += len(stat_name)
+        while idx < len(data) and data[idx] == 0:
+            idx += 1
+        if idx + 4 <= len(data):
+            return int.from_bytes(data[idx:idx+4], 'little')
+    return None
+
+def get_string_from_bin(data, stat_name):
+    idx = data.find(stat_name.encode())
+    if idx != -1:
+        idx += len(stat_name)
+        while idx < len(data) and data[idx] == 0:
+            idx += 1
+        end = idx
+        while end < len(data) and data[end] != 0:
+            end += 1
+        return data[idx:end].decode(errors='ignore')
+    return None
+
+def get_player_stats(bin_path):
+    with open(bin_path, 'rb') as f:
+        data = f.read()
+        kills = get_stat_from_bin(data, 'ZombieKills')
+        survived = get_stat_from_bin(data, 'SurvivedFor')
+        is_dead = get_stat_from_bin(data, 'isDead')
+        # Nombre: forename + surname (si existe)
+        forename = get_string_from_bin(data, 'forename')
+        surname = get_string_from_bin(data, 'surname')
+        if forename and surname:
+            name = f"{forename} {surname}"
+        elif forename:
+            name = forename
+        else:
+            name = os.path.basename(bin_path)
+        return {
+            'name': name,
+            'kills': kills if kills is not None else 0,
+            'survived': survived if survived is not None else 0,
+            'is_dead': is_dead == 1  # True si está muerto
+        }
+
+def format_survived(minutes):
+    # Convierte minutos a días, horas, minutos
+    td = timedelta(minutes=minutes)
+    days = td.days
+    hours, remainder = divmod(td.seconds, 3600)
+    mins = remainder // 60
+    return f"{days}d {hours}h {mins}m"
+
+def get_top_players(bin_folder, top_n=15):
     players = []
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, data FROM networkPlayers")
-        for name, data in cursor.fetchall():
-            if data is None:
-                continue
-            # Buscar el patrón ZombieKills en el binario
-            match = re.search(rb'ZombieKills\x00*([0-9]+)', data)
-            if not match:
-                # Alternativamente, busca el patrón como string seguido de 4 bytes (int)
-                match = re.search(rb'ZombieKills\x00{0,3}(.{4})', data)
-                if match:
-                    # Interpreta los 4 bytes como un entero little-endian
-                    kills = int.from_bytes(match.group(1), 'little')
-                else:
-                    kills = 0
-            else:
-                try:
-                    kills = int(match.group(1))
-                except Exception:
-                    kills = 0
-            players.append((name, kills))
-        conn.close()
-    except Exception as e:
-        print(f"Error al leer la base de datos: {e}")
-        return []
-    # Ordenar de mayor a menor
-    players.sort(key=lambda x: x[1], reverse=True)
+    for filename in os.listdir(bin_folder):
+        if filename.endswith('.bin'):
+            path = os.path.join(bin_folder, filename)
+            stats = get_player_stats(path)
+            # Solo jugadores vivos
+            if not stats['is_dead']:
+                players.append(stats)
+    players.sort(key=lambda x: x['kills'], reverse=True)
     return players[:top_n]
 
 @client.event
@@ -62,23 +91,23 @@ async def update_status():
         print("No se pudo encontrar el canal de Discord.")
         return
 
-    db_path = SERVER_PATH  # Ahora SERVER_PATH debe ser la ruta completa a players.db
-    if not os.path.exists(db_path):
-        ranking = "No se encontró la base de datos."
+    if not os.path.exists(BIN_FOLDER):
+        ranking = "No se encontró la carpeta de jugadores."
     else:
-        top_players = get_top_killers(db_path)
+        top_players = get_top_players(BIN_FOLDER)
         if not top_players:
-            ranking = "No hay datos de jugadores."
+            ranking = "No hay jugadores vivos en el ranking."
         else:
             ranking = ""
-            for idx, (name, kills) in enumerate(top_players, 1):
-                ranking += f"**{idx}. {name}** — {kills} kills\n"
+            for idx, player in enumerate(top_players, 1):
+                survived_str = format_survived(player['survived'])
+                ranking += f"**{idx}. {player['name']}** — {player['kills']} kills — {survived_str}\n"
 
     embed = discord.Embed(
         title=f"Ranking de Kills - {SERVER_NAME}",
         color=discord.Color.gold()
     )
-    embed.add_field(name="Top 15 jugadores con más kills", value=ranking, inline=False)
+    embed.add_field(name="Top 15 jugadores vivos con más kills", value=ranking, inline=False)
     embed.set_footer(text=f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     # Buscar y editar el último mensaje del bot
